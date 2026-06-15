@@ -1,0 +1,27 @@
+# Kredensial / config asli (ada password CCTV) - JANGAN di-commit
+config.yaml
+
+# Model weights (auto-download ultralytics)
+*.pt
+
+# Output (video, csv, heatmap, frame)
+output/
+
+# Video sample
+*.mp4
+*.avi
+*.mkv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
