@@ -17,6 +17,7 @@ Stack: YOLO11 (COCO person) + ByteTrack + Supervision zones. ROI & garis **custo
 | `setup_zones.py` | Editor interaktif gambar ROI + garis pakai mouse |
 | `zones.py` | Logika line-count, dwell kasir/kursi, heatmap |
 | `main.py` | Pipeline utama: detect → track → log CSV → video → heatmap |
+| `web_ui.py` | Dashboard browser (dev): live feed + counter + event + heatmap |
 
 ## Pakai
 
@@ -33,6 +34,16 @@ Stack: YOLO11 (COCO person) + ByteTrack + Supervision zones. ROI & garis **custo
    python main.py --no-window    # headless/server
    ```
    `q` di window buat stop. Output ke `output/`.
+4. Dashboard browser (dev, ganti cv2 window):
+   ```
+   python web_ui.py                 # RTSP live
+   python web_ui.py --source webcam # webcam laptop (--cam 0 default)
+   python web_ui.py --source file   # test pakai file video
+   python web_ui.py --port 8000     # ganti port (default 5000)
+   ```
+   Buka `http://localhost:5000` — live feed, counter IN/OUT/now, tabel event, heatmap (refresh 5s), peak hour. Pipeline jalan di background thread; stop pakai Ctrl+C.
+
+   **Gambar zona langsung di browser** (gak perlu `setup_zones.py`): toolbar di atas video → pilih *Garis/Kasir/Kursi/ROI*, klik di feed buat naro titik. Garis = 2 klik auto-save. Kotak = klik titik lalu *Tutup kotak* / Enter / klik-kanan (≥3 titik). *Flip garis* balik arah IN, *Hapus shape* undo terakhir. Tiap shape auto-save ke `config.yaml` + ZoneManager reload live (counter/tracking reset pas diedit).
 
 ## Output
 

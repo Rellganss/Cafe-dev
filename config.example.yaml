@@ -35,6 +35,8 @@ logic:
   seat_move_eps_px: 12
   zone_exit_grace_sec: 1.5
   min_box_area_px: 1200
+  line_anchor: bottom_center   # titik bbox yg dicek nyebrang garis. RTSP top-down: bottom_center (kaki). webcam close-up (kaki ke-crop): center
+  line_crossing_frames: 1      # frame berturut di sisi seberang biar kehitung. 1=paling responsif, naikin kalau bbox goyang/jitter
   heatmap_decay: 0.0
   heatmap_gamma: 0.5
 # Gambar pakai: python setup_zones.py  (r=ROI, l=garis, p=kasir, s=kursi)

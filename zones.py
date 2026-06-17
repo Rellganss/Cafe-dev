@@ -29,7 +29,17 @@ class ZoneManager:
         self.heat_decay = float(L.get("heatmap_decay", 0.0))
         self.heat_gamma = float(L.get("heatmap_gamma", 0.5))
 
-        # --- entry lines: anchor kaki + anti-jitter 2 frame ---
+        # anchor garis: titik bbox yg dicek nyebrang. RTSP top-down -> bottom_center (kaki).
+        # webcam close-up (kaki ke-crop) -> center, biar badan nyebrang kehitung.
+        anchor_map = {"bottom_center": sv.Position.BOTTOM_CENTER,
+                      "center": sv.Position.CENTER,
+                      "top_center": sv.Position.TOP_CENTER}
+        line_anchor = anchor_map.get(str(L.get("line_anchor", "bottom_center")).lower(),
+                                     sv.Position.BOTTOM_CENTER)
+        # frame berturut di sisi seberang biar kehitung. 1 = paling responsif.
+        line_frames = max(1, int(L.get("line_crossing_frames", 1)))
+
+        # --- entry lines ---
         # flip: true -> tuker start/end (balik arah IN/OUT) tanpa gambar ulang.
         self.lines = []
         for ln in cfg.get("lines", []) or []:
@@ -38,16 +48,17 @@ class ZoneManager:
                 s, e = e, s
             self.lines.append({"name": ln["name"], "zone": sv.LineZone(
                 start=sv.Point(*s), end=sv.Point(*e),
-                triggering_anchors=[sv.Position.BOTTOM_CENTER],
-                minimum_crossing_threshold=2)})
+                triggering_anchors=[line_anchor],
+                minimum_crossing_threshold=line_frames)})
 
-        # --- polygon zones: anchor kaki ---
+        # --- polygon zones: anchor sama kayak garis (bottom_center kaki / center webcam) ---
+        self.zone_anchor = line_anchor
         self.zones = []
         for z in cfg.get("zones", []) or []:
             self.zones.append({
                 "name": z["name"], "type": z["type"],
                 "zone": sv.PolygonZone(polygon=np.array(z["polygon"], dtype=np.int32),
-                                       triggering_anchors=[sv.Position.BOTTOM_CENTER]),
+                                       triggering_anchors=[line_anchor]),
                 "tracks": {},   # tid -> state dict
             })
 
