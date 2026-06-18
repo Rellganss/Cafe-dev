@@ -1,0 +1,40 @@
+source:
+  rtsp: rtsp://admin:Danizcctv7899@192.168.0.2:554/Streaming/Channels/101
+  file: sample.mp4
+model:
+  weights: yolov8s.pt
+  conf: 0.4
+  iou: 0.5
+  imgsz: 512
+  device: 0
+  classes:
+  - 0
+tracker:
+  track_activation_threshold: 0.25
+  lost_track_buffer: 60
+  minimum_matching_threshold: 0.8
+  frame_rate: 15
+processing:
+  frame_skip: 1
+  resize_width: 1280
+output:
+  annotated_video: output/annotated.mp4
+  save_video: true
+  events_csv: output/events.csv
+  peak_csv: output/peak_hourly.csv
+  heatmap_image: output/heatmap.png
+  show_window: true
+logic:
+  cashier_min_dwell_sec: 4
+  cashier_max_dwell_sec: 300
+  seat_min_dwell_sec: 30
+  seat_move_eps_px: 12
+  zone_exit_grace_sec: 1.5
+  min_box_area_px: 1200
+  line_anchor: center          # webcam close-up: center. RTSP top-down (kaki): bottom_center
+  line_crossing_frames: 1      # frame di sisi seberang biar kehitung. 1=responsif, naik kalau bbox goyang
+  heatmap_decay: 0.0
+  heatmap_gamma: 0.5
+detect_roi: []
+lines: []
+zones: []

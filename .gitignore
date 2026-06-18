@@ -1,5 +1,6 @@
-# Kredensial / config asli (ada password CCTV) - JANGAN di-commit
-config.yaml
+# Repo private -> config.yaml (berisi RTSP+password) ikut ke-commit.
+# Kalau nanti repo jadi PUBLIC: uncomment baris bawah + pakai config.example.yaml
+# config.yaml
 
 # Model weights (auto-download ultralytics)
 *.pt
