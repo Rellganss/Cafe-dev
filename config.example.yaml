@@ -1,6 +1,12 @@
 # Template config. Copy ke config.yaml lalu isi RTSP kamera lu:
 #   cp config.example.yaml config.yaml
-# config.yaml di-gitignore (berisi password) - JANGAN di-commit.
+#
+# FUNGSI ZONA (digambar di dashboard http://localhost:5000):
+#   detect_roi            -> AREA LANTAI. Cuma orang di sini dideteksi (buang poster dinding). Kosong=seluruh layar.
+#   lines (garis masuk)   -> orang nyebrang = dihitung MASUK / KELUAR.
+#   zones type: cashier   -> AREA KASIR. Orang diam di sini = TRANSAKSI.
+#   zones type: seat      -> AREA KURSI. Orang duduk di sini = DURASI DUDUK.
+#   zones type: staff     -> ZONA KERJA. Orang di sini = STAFF, gak dihitung customer.
 source:
   # Ganti user/pass/ip kamera. Hikvision: /Streaming/Channels/101 (main) atau 102 (sub).
   rtsp: rtsp://USER:PASSWORD@CAMERA_IP:554/Streaming/Channels/101
@@ -12,7 +18,10 @@ model:
   imgsz: 512             # 640 lebih akurat, 512/480 lebih cepat
   device: 0              # 0=GPU NVIDIA, "cpu"=CPU
   classes:
-  - 0                    # 0 = person (COCO)
+  - 0                    # 0 = person (COCO). Ini yg dihitung (masuk/duduk/transaksi).
+  furniture_classes:     # cuma DIGAMBAR + dihitung, gak masuk logika orang. [] = off
+  - 56                   # chair (kursi)
+  - 60                   # dining table (meja)
 tracker:
   track_activation_threshold: 0.25
   lost_track_buffer: 60
@@ -34,9 +43,18 @@ logic:
   seat_min_dwell_sec: 30
   seat_move_eps_px: 12
   zone_exit_grace_sec: 1.5
+  seat_memory_sec: 30          # MEMORI kursi: orang duduk yg ilang (occlusion/ID switch) diingat sekian detik. Balik di posisi sama -> dwell LANJUT, gak reset. 0=off
+  seat_memory_px: 120          # radius posisi (px) buat nyocokin orang yg balik ke kursi yg sama
   min_box_area_px: 1200
   line_anchor: bottom_center   # titik bbox yg dicek nyebrang garis. RTSP top-down: bottom_center (kaki). webcam close-up (kaki ke-crop): center
   line_crossing_frames: 1      # frame berturut di sisi seberang biar kehitung. 1=paling responsif, naikin kalau bbox goyang/jitter
+  auto_seat_from_chair: false  # true = chair (COCO) auto jadi zona kursi penghitung (gak usah gambar manual). butuh furniture_classes ada 56
+  auto_seat_ttl_sec: 3.0       # slot kursi-auto ilang kalau chair gak kelihatan sekian detik (anti-kedip)
+  auto_seat_grow_up: 0.6       # perbesar zona kursi-auto ke ATAS (x tinggi kursi) buat badan org duduk. Kekecilan=org duduk gak kena, kegedean=ketinggian/tumpuk
+  queue_alert_count: 3         # >= ini orang di kasir = alert "antri kasir"
+  snapshot_on_event: true      # simpen foto frame pas transaksi/orang masuk -> output/snapshots/
+  snapshot_retain_days: 7      # auto-hapus snapshot lebih tua dari ini (jaga disk). 0=simpen terus
+  db_retain_days: 0            # auto-hapus event DB lebih tua dari ini. 0=simpen history selamanya
   heatmap_decay: 0.0
   heatmap_gamma: 0.5
 # Gambar pakai: python setup_zones.py  (r=ROI, l=garis, p=kasir, s=kursi)

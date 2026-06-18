@@ -1,14 +1,39 @@
+# ================= CONFIG CAFE DETECTION =================
+# Auto-generate pas gambar zona di dashboard. Bagian lines/zones/detect_roi
+# bakal ketimpa kalau gambar ulang di browser.
+#
+# FUNGSI TIAP BAGIAN:
+#   detect_roi            -> AREA LANTAI. Cuma orang di dalam sini dideteksi.
+#                            Gunanya: buang orang di POSTER/BANNER dinding.
+#                            Kosong = deteksi seluruh layar.
+#   lines (garis)         -> GARIS MASUK. Orang nyebrang = dihitung MASUK/KELUAR.
+#   zones type: cashier   -> AREA KASIR. Diam di sini = dihitung TRANSAKSI.
+#   zones type: seat      -> AREA KURSI. Duduk di sini = dihitung DURASI DUDUK.
+#   zones type: staff     -> ZONA KERJA. Orang di sini = STAFF, TIDAK dihitung customer.
+#
+# SETELAN ANGKA (logic):
+#   cashier_min_dwell_sec -> min detik di kasir biar dihitung transaksi
+#   cashier_max_dwell_sec -> lebih dari ini = staff, BUKAN transaksi
+#   seat_min_dwell_sec    -> min detik DIAM biar dihitung beneran duduk
+#   seat_move_eps_px      -> gerak < ini px = dianggap diam
+#   zone_exit_grace_sec   -> toleransi ilang sebentar sblm dianggap keluar zona
+#   line_anchor           -> titik badan yg dicek nyebrang garis (center/bottom_center)
+#   min_box_area_px       -> buang kotak deteksi < ini (0 = terima semua)
+# ========================================================
 source:
   rtsp: rtsp://admin:Danizcctv7899@192.168.0.2:554/Streaming/Channels/101
   file: sample.mp4
 model:
   weights: yolov8s.pt
-  conf: 0.4
+  conf: 0.3
   iou: 0.5
-  imgsz: 512
+  imgsz: 640
   device: 0
   classes:
   - 0
+  furniture_classes:
+  - 56
+  - 60
 tracker:
   track_activation_threshold: 0.25
   lost_track_buffer: 60
@@ -30,11 +55,42 @@ logic:
   seat_min_dwell_sec: 30
   seat_move_eps_px: 12
   zone_exit_grace_sec: 1.5
-  min_box_area_px: 1200
-  line_anchor: center          # webcam close-up: center. RTSP top-down (kaki): bottom_center
-  line_crossing_frames: 1      # frame di sisi seberang biar kehitung. 1=responsif, naik kalau bbox goyang
+  seat_memory_sec: 30
+  seat_memory_px: 120
+  min_box_area_px: 0
+  line_anchor: center
+  line_crossing_frames: 1
+  auto_seat_from_chair: false
+  auto_seat_ttl_sec: 3.0
+  auto_seat_grow_up: 0.6
   heatmap_decay: 0.0
   heatmap_gamma: 0.5
 detect_roi: []
 lines: []
-zones: []
+zones:
+- name: meja_1
+  type: seat
+  polygon:
+  - - 263
+    - 512
+  - - 79
+    - 510
+  - - 58
+    - 712
+  - - 247
+    - 720
+  - - 263
+    - 512
+- name: meja_2
+  type: seat
+  polygon:
+  - - 862
+    - 361
+  - - 683
+    - 362
+  - - 675
+    - 577
+  - - 857
+    - 579
+  - - 864
+    - 361
