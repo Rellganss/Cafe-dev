@@ -68,6 +68,7 @@ STATE = {
 }
 LOCK = threading.Lock()
 STOP = threading.Event()
+RESTART = threading.Event()  # set dari /api/restart -> pipeline re-enter baca config baru (model/source/tracker)
 
 # ---- editor zona (browser gambar -> config -> reload ZoneManager live) ----
 ZM = {"zm": None}            # ZoneManager aktif (di-swap pas edit)
@@ -82,6 +83,60 @@ def _rebuild_zm():
     W, H = EDIT["wh"]
     if W and H:
         ZM["zm"] = ZoneManager(EDIT["cfg"], (W, H))
+
+
+# ---------- multi-kamera (switchable, zona per-kamera) ----------
+def _ensure_cameras(cfg):
+    """Jamin cfg punya list 'cameras' + 'active_camera'. Migrasi config lama (source+zona top-level) -> 1 kamera."""
+    cams = cfg.get("cameras")
+    if not cams:
+        src = cfg.get("source", {}) or {}
+        cfg["cameras"] = [{
+            "id": "cam1", "name": "Kamera 1", "type": "rtsp",
+            "address": src.get("rtsp", "") or "",
+            "lines": cfg.get("lines", []) or [],
+            "zones": cfg.get("zones", []) or [],
+            "detect_roi": cfg.get("detect_roi", []) or [],
+        }]
+        cfg["active_camera"] = "cam1"
+    elif not cfg.get("active_camera"):
+        cfg["active_camera"] = cams[0]["id"]
+    return cfg
+
+
+def _active_cam(cfg):
+    _ensure_cameras(cfg)
+    aid = cfg.get("active_camera")
+    for c in cfg["cameras"]:
+        if c["id"] == aid:
+            return c
+    return cfg["cameras"][0]
+
+
+def _load_active_zones(cfg):
+    """Salin zona kamera aktif -> top-level (dipakai ZoneManager + editor zona)."""
+    c = _active_cam(cfg)
+    cfg["lines"] = c.get("lines", []) or []
+    cfg["zones"] = c.get("zones", []) or []
+    cfg["detect_roi"] = c.get("detect_roi", []) or []
+
+
+def _sync_active_zones(cfg):
+    """Salin top-level zona -> kamera aktif (dipanggil sblm simpan, biar edit zona nyimpen ke kamera benar)."""
+    if not cfg.get("cameras"):
+        return
+    c = _active_cam(cfg)
+    c["lines"] = cfg.get("lines", []) or []
+    c["zones"] = cfg.get("zones", []) or []
+    c["detect_roi"] = cfg.get("detect_roi", []) or []
+
+
+def _new_cam_id(cfg):
+    ids = {c["id"] for c in cfg.get("cameras", [])}
+    n = 1
+    while f"cam{n}" in ids:
+        n += 1
+    return f"cam{n}"
 
 
 CONFIG_HEADER = """# ================= CONFIG CAFE DETECTION =================
@@ -110,6 +165,7 @@ CONFIG_HEADER = """# ================= CONFIG CAFE DETECTION =================
 
 
 def _save_cfg():
+    _sync_active_zones(EDIT["cfg"])     # zona top-level -> kamera aktif (sblm dump)
     with open(EDIT["path"], "w", encoding="utf-8") as f:
         f.write(CONFIG_HEADER)
         yaml.safe_dump(EDIT["cfg"], f, sort_keys=False, allow_unicode=True)
@@ -117,15 +173,23 @@ def _save_cfg():
 
 def pipeline(cfg, args):
     """Loop detect+track+zone, dorong annotated JPEG & stats ke STATE."""
-    use_file = args.source == "file"
-    use_cam = args.source == "webcam"
+    _ensure_cameras(cfg)
+    _load_active_zones(cfg)            # zona kamera aktif -> top-level (dipakai ZoneManager + editor)
+    cam0 = _active_cam(cfg)
+    use_file = cam0.get("type") == "file"
     os.makedirs("output", exist_ok=True)
 
     def open_src():
-        if use_cam:
-            c = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW)   # DSHOW: buka webcam cepat di Windows
-            return c, f"webcam:{args.cam}"
-        return open_stream(cfg, use_file)
+        cam = _active_cam(cfg)         # baca tiap dipanggil (reconnect ikut kamera aktif terbaru)
+        typ, addr = cam.get("type", "rtsp"), str(cam.get("address", "") or "")
+        if typ == "webcam":
+            idx = int(addr) if addr.strip().lstrip("-").isdigit() else 0
+            c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)   # DSHOW: buka webcam cepat di Windows
+            return c, f"webcam:{idx}"
+        c = cv2.VideoCapture(addr)
+        if typ == "rtsp":
+            c.set(cv2.CAP_PROP_BUFFERSIZE, 1)          # low latency RTSP
+        return c, addr
 
     model = YOLO(cfg["model"]["weights"])
     tracker = sv.ByteTrack(
@@ -213,6 +277,8 @@ def pipeline(cfg, args):
         if frame_idx % skip != 0:
             continue
 
+        if RESTART.is_set():           # /api/restart -> keluar loop, supervisor re-load model/source/tracker
+            break
         # re-baca knob "panas" tiap frame -> bisa diubah live dari /api/settings tanpa restart
         with ZLOCK:
             lg, disp = cfg["logic"], (cfg.get("display") or {})
@@ -442,13 +508,36 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
   .xbtn{margin-left:auto;background:#21262d;color:var(--tx);border:1px solid var(--bd);
         border-radius:6px;padding:4px 10px;cursor:pointer}
   .sbody{padding:8px 16px;overflow:auto}
+  .ssec{font-size:11px;font-weight:700;color:var(--acc);text-transform:uppercase;letter-spacing:.5px;
+        margin:12px 0 2px;padding-top:8px;border-top:1px solid var(--bd)}
+  .ssec:first-child{border-top:0;margin-top:2px}
   .srow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #21262d}
   .srow:last-child{border-bottom:0}
   .srow label{flex:1;font-size:13px}
   .srow .kk{font-size:10px;color:var(--mut);display:block}
-  .srow input[type=number],.srow input[type=text]{width:120px;background:#0d1117;color:var(--tx);
+  .rbadge{font-size:9px;background:#3d2d00;color:#e3b341;border:1px solid #9e7b00;
+          border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:middle}
+  .srow input[type=number],.srow input[type=text],.srow select{width:130px;background:#0d1117;color:var(--tx);
         border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font-size:13px}
   .srow input[type=checkbox]{width:18px;height:18px}
+  .rbtn{background:#21262d;color:#e3b341;border:1px solid #9e7b00;border-radius:6px;
+        padding:8px 14px;font-weight:600;cursor:pointer}
+  #cam_sel{background:#21262d;color:var(--tx);border:1px solid var(--bd);border-radius:6px;
+        padding:5px 8px;font-size:12px;max-width:160px}
+  .camrow{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #21262d}
+  .camrow input,.camrow select{background:#0d1117;color:var(--tx);border:1px solid var(--bd);
+        border-radius:6px;padding:5px 7px;font-size:12px}
+  .camrow .cn{width:96px} .camrow .ca{flex:1;min-width:90px}
+  .camrow .tag{font-size:9px;color:var(--in);border:1px solid var(--in);border-radius:4px;padding:1px 5px}
+  .camrow button{background:#21262d;color:var(--tx);border:1px solid var(--bd);border-radius:6px;
+        padding:5px 8px;font-size:12px;cursor:pointer}
+  .camrow button.sw{color:#58a6ff;border-color:#1f6feb}
+  .camrow button.del{color:#f85149;border-color:#6e2723}
+  .camadd{display:flex;gap:6px;flex-wrap:wrap;padding:8px 0 4px;border-bottom:1px solid var(--bd)}
+  .camadd input{flex:1;min-width:80px;background:#0d1117;color:var(--tx);border:1px solid var(--bd);
+        border-radius:6px;padding:6px 8px;font-size:12px}
+  .camadd #ca_addr{flex-basis:100%}
+  .camadd select{background:#0d1117;color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px}
   .sfoot{padding:12px 16px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:10px}
   .smut{font-size:11px;color:var(--mut);flex:1}
   .savebtn{background:var(--in);color:#000;border:0;border-radius:6px;padding:8px 16px;
@@ -496,6 +585,8 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
       <span class=sep></span>
       <button id=b_auto>🪑 Auto-kursi: ?</button>
       <span class=sep></span>
+      <span style="font-size:12px;color:var(--mut)">📷</span>
+      <select id=cam_sel title="kamera aktif"></select>
       <button id=b_settings>⚙ Setelan</button>
       <span class=hint id=ehint>mode Lihat</span>
     </div>
@@ -556,9 +647,24 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
   <div class=sheet>
     <div class=shead><b>⚙ Setelan (live)</b>
       <button id=s_close class=xbtn>✕</button></div>
-    <div class=sbody id=s_fields>memuat…</div>
+    <div class=sbody>
+      <div class=ssec>Kamera</div>
+      <div id=cam_mgr>memuat…</div>
+      <div class=camadd>
+        <input id=ca_name placeholder="nama (cth: Pintu Depan)">
+        <select id=ca_type>
+          <option value=rtsp>RTSP</option>
+          <option value=webcam>Webcam</option>
+          <option value=file>File</option>
+        </select>
+        <input id=ca_addr placeholder="rtsp://... / index webcam / path file">
+        <button id=ca_add class=savebtn>+ Tambah</button>
+      </div>
+      <div id=s_fields>memuat…</div>
+    </div>
     <div class=sfoot>
-      <span class=smut>Tersimpan ke config.yaml. stream_fps butuh reload halaman.</span>
+      <span class=smut>Disimpan ke config.yaml. Tag <b>restart</b> = perlu reload pipeline.</span>
+      <button id=s_restart class=rbtn>♻ Simpan & Restart</button>
       <button id=s_save class=savebtn>💾 Simpan</button>
     </div>
   </div>
@@ -720,6 +826,13 @@ $('#b_auto').onclick=()=>post('/api/toggle_auto');
 
 // ----- panel setelan -----
 const SLABEL={
+ rtsp:'Sumber RTSP (URL CCTV)', file:'File video (mode file)',
+ weights:'Model YOLO (.pt)', conf:'Confidence orang', iou:'IoU NMS',
+ imgsz:'Ukuran inferensi (px)', device:'Device (0=GPU, cpu)',
+ furniture_conf:'Conf furnitur (kursi/meja)',
+ track_activation_threshold:'Tracker: ambang aktif', lost_track_buffer:'Tracker: buffer ilang (frame)',
+ minimum_matching_threshold:'Tracker: ambang cocok', frame_rate:'Tracker: frame rate',
+ frame_skip:'Proses tiap N frame', resize_width:'Resize lebar (px)',
  cashier_min_dwell_sec:'Kasir: min detik = transaksi',
  cashier_max_dwell_sec:'Kasir: max detik (lebih=staff)',
  seat_min_dwell_sec:'Kursi: min detik diam = duduk',
@@ -728,7 +841,9 @@ const SLABEL={
  seat_memory_sec:'Memori kursi: ingat brp detik',
  seat_memory_px:'Memori kursi: radius cocok (px)',
  min_box_area_px:'Buang kotak < px² (0=semua)',
+ line_anchor:'Titik cek nyebrang garis',
  line_crossing_frames:'Frame nyebrang garis',
+ auto_seat_from_chair:'Auto-kursi dari chair',
  auto_seat_ttl_sec:'Auto-kursi: slot ilang (dtk)',
  auto_seat_grow_up:'Auto-kursi: perbesar ke atas ×',
  auto_seat_ema:'Auto-kursi: smoothing (0-1)',
@@ -737,9 +852,12 @@ const SLABEL={
  max_capacity:'Alert kapasitas penuh (0=off)',
  open_hours:'Jam buka (kosong=24j, 08:00-22:00)',
  snapshot_on_event:'Foto pas event',
+ snapshot_events:'Event di-foto (pisah koma)',
+ snapshot_retain_days:'Hapus snapshot > hari (0=off)',
+ db_retain_days:'Hapus event DB > hari (0=off)',
+ heatmap_decay:'Heatmap decay (0=off)',
  heatmap_gamma:'Heatmap gamma (<1 angkat sepi)',
  heatmap_blur:'Heatmap blur',
- furniture_conf:'Conf furnitur (kursi/meja)',
  show_boxes:'Tampil kotak orang',
  show_labels:'Tampil label id/detik',
  show_zones:'Tampil garis/zona',
@@ -747,33 +865,107 @@ const SLABEL={
  stream_fps:'FPS stream ke browser',
  heatmap_refresh_sec:'Refresh heatmap (dtk)',
 };
+const SECNAME={source:'Sumber',model:'Model',tracker:'Tracker',processing:'Proses',logic:'Logika',display:'Tampilan'};
 let SFIELDS=[];
+function fldInput(f,i){
+  if(f.type==='bool')return `<input type=checkbox data-i=${i} ${f.val?'checked':''}>`;
+  if(f.type==='list')return `<input type=text data-i=${i} value="${f.val??''}">`;
+  if(f.type&&f.type.startsWith('enum:')){
+    const opts=f.type.slice(5).split(',');
+    return `<select data-i=${i}>`+opts.map(o=>`<option ${o==f.val?'selected':''}>${o}</option>`).join('')+`</select>`;
+  }
+  if(f.type==='str')return `<input type=text data-i=${i} value="${f.val??''}">`;
+  return `<input type=number step=any data-i=${i} value="${f.val??0}">`;
+}
 async function openSettings(){
   const d=await(await fetch('/api/settings')).json();
   SFIELDS=d.fields||[];
-  $('#s_fields').innerHTML=SFIELDS.map((f,i)=>{
+  let html='',cur='';
+  SFIELDS.forEach((f,i)=>{
+    if(f.sec!==cur){cur=f.sec;html+=`<div class=ssec>${SECNAME[cur]||cur}</div>`;}
     const lab=SLABEL[f.key]||f.key;
-    let inp;
-    if(f.type==='bool')inp=`<input type=checkbox data-i=${i} ${f.val?'checked':''}>`;
-    else if(f.type==='str')inp=`<input type=text data-i=${i} value="${f.val??''}">`;
-    else inp=`<input type=number step=any data-i=${i} value="${f.val??0}">`;
-    return `<div class=srow><label>${lab}<span class=kk>${f.key}</span></label>${inp}</div>`;
-  }).join('');
+    const badge=f.restart?'<span class=rbadge>restart</span>':'';
+    html+=`<div class=srow><label>${lab}${badge}<span class=kk>${f.key}</span></label>${fldInput(f,i)}</div>`;
+  });
+  $('#s_fields').innerHTML=html;
+  await loadCameras();
   $('#settings_modal').classList.add('on');
+}
+function collectSettings(){
+  const body={};
+  $('#s_fields').querySelectorAll('[data-i]').forEach(el=>{
+    const f=SFIELDS[+el.dataset.i];
+    body[f.key]=f.type==='bool'?el.checked:el.value;
+  });
+  return body;
 }
 $('#b_settings').onclick=openSettings;
 $('#s_close').onclick=()=>$('#settings_modal').classList.remove('on');
 $('#settings_modal').addEventListener('click',e=>{
   if(e.target.id==='settings_modal')$('#settings_modal').classList.remove('on');});
 $('#s_save').onclick=async()=>{
-  const body={};
-  $('#s_fields').querySelectorAll('input[data-i]').forEach(el=>{
-    const f=SFIELDS[+el.dataset.i];
-    body[f.key]=f.type==='bool'?el.checked:el.value;
-  });
-  const r=await post('/api/settings',body);
-  if(r&&r.ok){$('#settings_modal').classList.remove('on');
-    $('#feed').src='/video?'+Date.now();}  // reload stream biar stream_fps/display kepasang
+  const r=await post('/api/settings',collectSettings());
+  if(r&&r.ok){
+    if(r.need_restart){
+      if(confirm('Ada setelan model/sumber/tracker berubah. Restart pipeline sekarang?')){
+        await post('/api/restart');
+      }
+    }
+    $('#settings_modal').classList.remove('on');
+    setTimeout(()=>{$('#feed').src='/video?'+Date.now();},800);
+  }
+};
+$('#s_restart').onclick=async()=>{
+  await post('/api/settings',collectSettings());   // simpan dulu
+  await post('/api/restart');
+  $('#settings_modal').classList.remove('on');
+  setTimeout(()=>{$('#feed').src='/video?'+Date.now();},1200);
+};
+
+// ----- kamera (switchable) -----
+const esc=s=>String(s==null?'':s).replace(/"/g,'&quot;');
+async function loadCameras(){
+  let d; try{d=await(await fetch('/api/cameras')).json();}catch(e){return;}
+  const cams=d.cameras||[],act=d.active;
+  $('#cam_sel').innerHTML=cams.map(c=>`<option value="${c.id}" ${c.id==act?'selected':''}>${esc(c.name)}</option>`).join('');
+  const mg=$('#cam_mgr'); if(!mg)return;
+  mg.innerHTML=cams.map(c=>{
+    const a=c.id==act;
+    return `<div class=camrow data-id="${c.id}">`+
+      `<input class=cn value="${esc(c.name)}" title=nama>`+
+      `<select class=ct>${['rtsp','webcam','file'].map(t=>`<option ${t==c.type?'selected':''}>${t}</option>`).join('')}</select>`+
+      `<input class=ca value="${esc(c.address)}" title=alamat>`+
+      (a?`<span class=tag>AKTIF</span>`:`<button class=sw>Pakai</button>`)+
+      `<button class=upd title=simpan>💾</button>`+
+      (a?'':`<button class=del title=hapus>🗑</button>`)+
+      `</div>`;
+  }).join('')||'<div class=empty>belum ada kamera</div>';
+}
+function reloadFeed(ms){setTimeout(()=>{$('#feed').src='/video?'+Date.now();},ms||1000);}
+$('#cam_sel').onchange=async()=>{
+  await post('/api/camera/switch',{id:$('#cam_sel').value});
+  await loadCameras();reloadFeed();
+};
+$('#cam_mgr').addEventListener('click',async e=>{
+  const row=e.target.closest('.camrow'); if(!row)return;
+  const id=row.dataset.id;
+  if(e.target.classList.contains('sw')){
+    await post('/api/camera/switch',{id});await loadCameras();reloadFeed();
+  }else if(e.target.classList.contains('del')){
+    if(confirm('Hapus kamera ini?')){await post('/api/camera/delete',{id});await loadCameras();}
+  }else if(e.target.classList.contains('upd')){
+    const r=await post('/api/camera/update',{id,
+      name:row.querySelector('.cn').value,type:row.querySelector('.ct').value,
+      address:row.querySelector('.ca').value});
+    await loadCameras(); if(r&&r.restart)reloadFeed();
+  }
+});
+$('#ca_add').onclick=async()=>{
+  const name=$('#ca_name').value,type=$('#ca_type').value,address=$('#ca_addr').value;
+  if(!address&&type!=='webcam'){alert('isi alamat dulu');return;}
+  await post('/api/camera/add',{name,type,address});
+  $('#ca_name').value='';$('#ca_addr').value='';
+  await loadCameras();
 };
 window.addEventListener('keydown',e=>{
   if(e.key==='Enter')commitPoly();
@@ -781,6 +973,7 @@ window.addEventListener('keydown',e=>{
   else if(e.key==='Escape'){pts=[];setMode('view');}
 });
 loadCfg();setInterval(loadCfg,4000);   // sync shape kalau diedit dari tempat lain
+loadCameras();   // isi dropdown kamera toolbar
 </script></body></html>"""
 
 
@@ -976,34 +1169,59 @@ def clear_roi():
     return jsonify({"ok": True})
 
 
-# Knob yg bisa diubah live dari web. (section, key, tipe). Model/source/tracker = restart-only, gak masuk sini.
+# SEMUA knob yg bisa diatur dari web. (section, key, tipe, restart).
+#   restart=False -> langsung jalan (re-baca tiap frame / rebuild ZoneManager).
+#   restart=True  -> butuh klik "Restart" (reload model/source/tracker/resolusi).
+# Dikecualikan (file-only, bahaya kalau diubah remote): server.host/port.
 SETTINGS_SPEC = [
-    ("logic", "cashier_min_dwell_sec", "num"),
-    ("logic", "cashier_max_dwell_sec", "num"),
-    ("logic", "seat_min_dwell_sec", "num"),
-    ("logic", "seat_move_eps_px", "num"),
-    ("logic", "zone_exit_grace_sec", "num"),
-    ("logic", "seat_memory_sec", "num"),
-    ("logic", "seat_memory_px", "num"),
-    ("logic", "min_box_area_px", "num"),
-    ("logic", "line_crossing_frames", "num"),
-    ("logic", "auto_seat_ttl_sec", "num"),
-    ("logic", "auto_seat_grow_up", "num"),
-    ("logic", "auto_seat_ema", "num"),
-    ("logic", "auto_seat_iou", "num"),
-    ("logic", "queue_alert_count", "num"),
-    ("logic", "max_capacity", "num"),
-    ("logic", "open_hours", "str"),
-    ("logic", "snapshot_on_event", "bool"),
-    ("logic", "heatmap_gamma", "num"),
-    ("logic", "heatmap_blur", "num"),
-    ("model", "furniture_conf", "num"),
-    ("display", "show_boxes", "bool"),
-    ("display", "show_labels", "bool"),
-    ("display", "show_zones", "bool"),
-    ("display", "jpeg_quality", "num"),
-    ("display", "stream_fps", "num"),
-    ("display", "heatmap_refresh_sec", "num"),
+    # ---- model (RESTART). Sumber/kamera dikelola panel Kamera, bukan di sini ----
+    ("model", "weights", "str", True),
+    ("model", "conf", "num", True),
+    ("model", "iou", "num", True),
+    ("model", "imgsz", "num", True),
+    ("model", "device", "str", True),
+    ("model", "furniture_conf", "num", False),
+    # ---- tracker (RESTART) ----
+    ("tracker", "track_activation_threshold", "num", True),
+    ("tracker", "lost_track_buffer", "num", True),
+    ("tracker", "minimum_matching_threshold", "num", True),
+    ("tracker", "frame_rate", "num", True),
+    # ---- processing (RESTART) ----
+    ("processing", "frame_skip", "num", True),
+    ("processing", "resize_width", "num", True),
+    # ---- logika (LIVE) ----
+    ("logic", "cashier_min_dwell_sec", "num", False),
+    ("logic", "cashier_max_dwell_sec", "num", False),
+    ("logic", "seat_min_dwell_sec", "num", False),
+    ("logic", "seat_move_eps_px", "num", False),
+    ("logic", "zone_exit_grace_sec", "num", False),
+    ("logic", "seat_memory_sec", "num", False),
+    ("logic", "seat_memory_px", "num", False),
+    ("logic", "min_box_area_px", "num", False),
+    ("logic", "line_anchor", "enum:center,bottom_center", False),
+    ("logic", "line_crossing_frames", "num", False),
+    ("logic", "auto_seat_from_chair", "bool", False),
+    ("logic", "auto_seat_ttl_sec", "num", False),
+    ("logic", "auto_seat_grow_up", "num", False),
+    ("logic", "auto_seat_ema", "num", False),
+    ("logic", "auto_seat_iou", "num", False),
+    ("logic", "queue_alert_count", "num", False),
+    ("logic", "max_capacity", "num", False),
+    ("logic", "open_hours", "str", False),
+    ("logic", "snapshot_on_event", "bool", False),
+    ("logic", "snapshot_events", "list", False),
+    ("logic", "snapshot_retain_days", "num", False),
+    ("logic", "db_retain_days", "num", False),
+    ("logic", "heatmap_decay", "num", False),
+    ("logic", "heatmap_gamma", "num", False),
+    ("logic", "heatmap_blur", "num", False),
+    # ---- tampilan (LIVE) ----
+    ("display", "show_boxes", "bool", False),
+    ("display", "show_labels", "bool", False),
+    ("display", "show_zones", "bool", False),
+    ("display", "jpeg_quality", "num", False),
+    ("display", "stream_fps", "num", False),
+    ("display", "heatmap_refresh_sec", "num", False),
 ]
 
 
@@ -1015,19 +1233,22 @@ def settings():
     if request.method == "GET":
         with ZLOCK:
             out = []
-            for sec, key, typ in SETTINGS_SPEC:
+            for sec, key, typ, rst in SETTINGS_SPEC:
                 val = (cfg.get(sec) or {}).get(key)
-                out.append({"sec": sec, "key": key, "type": typ, "val": val})
+                if typ == "list":
+                    val = ", ".join(str(x) for x in (val or []))
+                out.append({"sec": sec, "key": key, "type": typ, "val": val, "restart": rst})
         return jsonify({"fields": out})
 
-    # POST: {key: val, ...}  (key unik antar section krn gak ada bentrok)
+    # POST: {key: val, ...}  (key unik antar section)
     d = request.get_json(force=True) or {}
-    spec = {k: (sec, t) for sec, k, t in SETTINGS_SPEC}
+    spec = {k: (sec, t, rst) for sec, k, t, rst in SETTINGS_SPEC}
+    need_restart = False
     with ZLOCK:
         for k, v in d.items():
             if k not in spec:
                 continue
-            sec, typ = spec[k]
+            sec, typ, rst = spec[k]
             try:
                 if typ == "num":
                     v = float(v)
@@ -1035,14 +1256,132 @@ def settings():
                         v = int(v)
                 elif typ == "bool":
                     v = bool(v)
+                elif typ == "list":
+                    v = [s.strip() for s in str(v).split(",") if s.strip()]
+                elif typ.startswith("enum:"):
+                    allowed = typ.split(":", 1)[1].split(",")
+                    v = str(v)
+                    if v not in allowed:
+                        continue
                 else:
                     v = str(v)
             except (TypeError, ValueError):
                 continue
+            old = cfg.setdefault(sec, {}).get(k)
+            if old != v and rst:
+                need_restart = True
             cfg.setdefault(sec, {})[k] = v
         _save_cfg()
-        _rebuild_zm()          # dwell/auto-seat knob masuk ZoneManager langsung
+        _rebuild_zm()          # knob live (dwell/auto-seat/anchor) masuk ZoneManager langsung
+    return jsonify({"ok": True, "need_restart": need_restart})
+
+
+@app.route("/api/restart", methods=["POST"])
+def restart_pipeline():
+    """Reload pipeline (model/source/tracker/resolusi) tanpa matiin proses Flask."""
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False}), 409
+    RESTART.set()
     return jsonify({"ok": True})
+
+
+# ---------------- kamera (switchable, zona per-kamera) ----------------
+@app.route("/api/cameras")
+def cameras_list():
+    if EDIT["cfg"] is None:
+        return jsonify({"cameras": [], "active": None})
+    with ZLOCK:
+        _ensure_cameras(EDIT["cfg"])
+        cams = [{"id": c["id"], "name": c.get("name", c["id"]),
+                 "type": c.get("type", "rtsp"), "address": c.get("address", ""),
+                 "zones": len(c.get("zones") or []), "lines": len(c.get("lines") or [])}
+                for c in EDIT["cfg"]["cameras"]]
+        return jsonify({"cameras": cams, "active": EDIT["cfg"]["active_camera"]})
+
+
+@app.route("/api/camera/add", methods=["POST"])
+def camera_add():
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False}), 409
+    d = request.get_json(force=True) or {}
+    typ = d.get("type", "rtsp")
+    if typ not in ("rtsp", "file", "webcam"):
+        return jsonify({"ok": False, "err": "tipe harus rtsp/file/webcam"}), 400
+    with ZLOCK:
+        cfg = EDIT["cfg"]
+        _ensure_cameras(cfg)
+        cid = _new_cam_id(cfg)
+        cfg["cameras"].append({
+            "id": cid, "name": (d.get("name") or cid).strip(), "type": typ,
+            "address": (d.get("address") or "").strip(),
+            "lines": [], "zones": [], "detect_roi": [],
+        })
+        _save_cfg()
+    return jsonify({"ok": True, "id": cid})
+
+
+@app.route("/api/camera/update", methods=["POST"])
+def camera_update():
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False}), 409
+    d = request.get_json(force=True) or {}
+    cid = d.get("id")
+    with ZLOCK:
+        cfg = EDIT["cfg"]
+        _ensure_cameras(cfg)
+        cam = next((c for c in cfg["cameras"] if c["id"] == cid), None)
+        if not cam:
+            return jsonify({"ok": False, "err": "kamera tak ada"}), 404
+        if "name" in d:
+            cam["name"] = (d["name"] or cam["id"]).strip()
+        if d.get("type") in ("rtsp", "file", "webcam"):
+            cam["type"] = d["type"]
+        if "address" in d:
+            cam["address"] = (d["address"] or "").strip()
+        _save_cfg()
+    # kalau yg diedit kamera aktif -> restart biar sumber baru kebuka
+    restart = (cid == cfg["active_camera"])
+    if restart:
+        RESTART.set()
+    return jsonify({"ok": True, "restart": restart})
+
+
+@app.route("/api/camera/delete", methods=["POST"])
+def camera_delete():
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False}), 409
+    cid = (request.get_json(force=True) or {}).get("id")
+    with ZLOCK:
+        cfg = EDIT["cfg"]
+        _ensure_cameras(cfg)
+        if len(cfg["cameras"]) <= 1:
+            return jsonify({"ok": False, "err": "minimal 1 kamera"}), 400
+        if cid == cfg["active_camera"]:
+            return jsonify({"ok": False, "err": "kamera aktif, switch dulu sblm hapus"}), 400
+        cfg["cameras"] = [c for c in cfg["cameras"] if c["id"] != cid]
+        _save_cfg()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/camera/switch", methods=["POST"])
+def camera_switch():
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False}), 409
+    cid = (request.get_json(force=True) or {}).get("id")
+    with ZLOCK:
+        cfg = EDIT["cfg"]
+        _ensure_cameras(cfg)
+        if cid not in [c["id"] for c in cfg["cameras"]]:
+            return jsonify({"ok": False, "err": "kamera tak ada"}), 404
+        if cid == cfg["active_camera"]:
+            return jsonify({"ok": True, "active": cid})   # udah aktif
+        _sync_active_zones(cfg)            # simpen zona kamera lama
+        cfg["active_camera"] = cid
+        _load_active_zones(cfg)            # load zona kamera baru -> top-level
+        _save_cfg()
+        _rebuild_zm()
+    RESTART.set()                          # reopen source kamera baru
+    return jsonify({"ok": True, "active": cid})
 
 
 def cleanup_snapshots(folder, days):
@@ -1064,9 +1403,9 @@ def cleanup_snapshots(folder, days):
 
 def maintenance(cfg):
     """Thread retensi: hapus snapshot & event lama tiap jam (anti disk penuh)."""
-    snap_days = int(cfg["logic"].get("snapshot_retain_days", 7))
-    db_days = int(cfg["logic"].get("db_retain_days", 0))   # 0 = simpen history selamanya
     while not STOP.is_set():
+        snap_days = int(cfg["logic"].get("snapshot_retain_days", 7))  # re-baca tiap jam -> live
+        db_days = int(cfg["logic"].get("db_retain_days", 0))          # 0 = simpen history selamanya
         try:
             ns = cleanup_snapshots("output/snapshots", snap_days)
             nd = STORE.prune(db_days)
@@ -1088,6 +1427,10 @@ def pipeline_supervisor(cfg, args):
             STATE["alive"] = False
         if STOP.is_set():
             break
+        if RESTART.is_set():           # restart manual dari web: langsung re-enter, tanpa tunggu
+            RESTART.clear()
+            print("[restart] reload pipeline (config baru) dari web")
+            continue
         print("[watchdog] restart pipeline 3s lagi...")
         STOP.wait(3.0)
 
