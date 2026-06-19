@@ -17,9 +17,11 @@ model:
   device: 0              # 0=GPU, "cpu"=CPU
   classes:
   - 0                    # 0 = person (yg dihitung)
-  furniture_classes:     # cuma DIGAMBAR + dihitung, gak masuk logika orang. [] = off
+  furniture_classes:     # objek DIGAMBAR (bukan logika orang). On/off di web (panel Objek). [] = off
+  - 42                   # fork (garpu)
   - 56                   # chair (kursi)
   - 60                   # dining table (meja)
+  # COCO id lain: 39 botol, 41 cangkir, 43 pisau, 44 sendok, 45 mangkok, 57 sofa, 63 laptop, 67 hp, 73 buku
   furniture_conf: 0.4    # conf khusus furnitur (lebih tinggi -> kurangi salah deteksi)
 tracker:
   track_activation_threshold: 0.25

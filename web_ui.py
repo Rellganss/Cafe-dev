@@ -35,7 +35,11 @@ from main import load_cfg, open_stream, LatestFrame
 from storage import Store
 
 STORE = Store()              # SQLite persist event + metrik harian
-FURN_NAMES = {56: "kursi", 60: "meja"}   # COCO: 56=chair, 60=dining table
+# Katalog COCO relevan kafe (id -> nama). Dipakai label gambar + UI on/off class.
+COCO_NAMES = {
+    0: "orang", 41: "cup", 56: "kursi", 57: "sofa", 60: "meja",
+}
+FURN_NAMES = COCO_NAMES      # alias: nama buat gambar kotak furnitur/objek
 
 
 def is_open(spec):
@@ -538,6 +542,11 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
         border-radius:6px;padding:6px 8px;font-size:12px}
   .camadd #ca_addr{flex-basis:100%}
   .camadd select{background:#0d1117;color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px}
+  .clshint{font-size:11px;color:var(--mut);padding:2px 0 6px}
+  #cls_grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 10px}
+  .clschip{display:flex;align-items:center;gap:6px;font-size:12px;padding:3px 0}
+  .clschip input{width:16px;height:16px}
+  .clschip .cid{font-size:9px;color:var(--mut)}
   .sfoot{padding:12px 16px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:10px}
   .smut{font-size:11px;color:var(--mut);flex:1}
   .savebtn{background:var(--in);color:#000;border:0;border-radius:6px;padding:8px 16px;
@@ -659,6 +668,12 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
         </select>
         <input id=ca_addr placeholder="rtsp://... / index webcam / path file">
         <button id=ca_add class=savebtn>+ Tambah</button>
+      </div>
+      <div class=ssec>Objek terdeteksi</div>
+      <div class=clshint>Centang objek yg mau dideteksi. <b>orang</b> = penghitungan; lainnya = digambar saja. Perlu restart.</div>
+      <div id=cls_grid>memuat…</div>
+      <div style="text-align:right;padding:8px 0">
+        <button id=cls_save class=rbtn>♻ Simpan objek & Restart</button>
       </div>
       <div id=s_fields>memuat…</div>
     </div>
@@ -889,6 +904,7 @@ async function openSettings(){
   });
   $('#s_fields').innerHTML=html;
   await loadCameras();
+  await loadClasses();
   $('#settings_modal').classList.add('on');
 }
 function collectSettings(){
@@ -966,6 +982,27 @@ $('#ca_add').onclick=async()=>{
   await post('/api/camera/add',{name,type,address});
   $('#ca_name').value='';$('#ca_addr').value='';
   await loadCameras();
+};
+
+// ----- objek/class on-off -----
+async function loadClasses(){
+  let d; try{d=await(await fetch('/api/classes')).json();}catch(e){return;}
+  const on=new Set(d.furniture||[]);
+  $('#cls_grid').innerHTML=(d.catalog||[]).map(c=>{
+    const checked=(c.id===0)?d.person:on.has(c.id);
+    return `<label class=clschip><input type=checkbox data-id=${c.id} ${checked?'checked':''}>`+
+           `${c.name} <span class=cid>#${c.id}</span></label>`;
+  }).join('');
+}
+$('#cls_save').onclick=async()=>{
+  let person=true; const furniture=[];
+  $('#cls_grid').querySelectorAll('input[data-id]').forEach(el=>{
+    const id=+el.dataset.id;
+    if(id===0)person=el.checked;
+    else if(el.checked)furniture.push(id);
+  });
+  await post('/api/classes',{person,furniture});
+  reloadFeed(1200);
 };
 window.addEventListener('keydown',e=>{
   if(e.key==='Enter')commitPoly();
@@ -1174,55 +1211,24 @@ def clear_roi():
 #   restart=True  -> butuh klik "Restart" (reload model/source/tracker/resolusi).
 # Dikecualikan (file-only, bahaya kalau diubah remote): server.host/port.
 SETTINGS_SPEC = [
-    # ---- model (RESTART). Sumber/kamera dikelola panel Kamera, bukan di sini ----
-    ("model", "weights", "str", True),
-    ("model", "conf", "num", True),
-    ("model", "iou", "num", True),
-    ("model", "imgsz", "num", True),
-    ("model", "device", "str", True),
-    ("model", "furniture_conf", "num", False),
-    # ---- tracker (RESTART) ----
-    ("tracker", "track_activation_threshold", "num", True),
-    ("tracker", "lost_track_buffer", "num", True),
-    ("tracker", "minimum_matching_threshold", "num", True),
-    ("tracker", "frame_rate", "num", True),
-    # ---- processing (RESTART) ----
-    ("processing", "frame_skip", "num", True),
-    ("processing", "resize_width", "num", True),
-    # ---- logika (LIVE) ----
-    ("logic", "cashier_min_dwell_sec", "num", False),
-    ("logic", "cashier_max_dwell_sec", "num", False),
-    ("logic", "seat_min_dwell_sec", "num", False),
-    ("logic", "seat_move_eps_px", "num", False),
-    ("logic", "zone_exit_grace_sec", "num", False),
-    ("logic", "seat_memory_sec", "num", False),
-    ("logic", "seat_memory_px", "num", False),
-    ("logic", "min_box_area_px", "num", False),
-    ("logic", "line_anchor", "enum:center,bottom_center", False),
-    ("logic", "line_crossing_frames", "num", False),
-    ("logic", "auto_seat_from_chair", "bool", False),
-    ("logic", "auto_seat_ttl_sec", "num", False),
-    ("logic", "auto_seat_grow_up", "num", False),
-    ("logic", "auto_seat_ema", "num", False),
-    ("logic", "auto_seat_iou", "num", False),
-    ("logic", "queue_alert_count", "num", False),
-    ("logic", "max_capacity", "num", False),
-    ("logic", "open_hours", "str", False),
-    ("logic", "snapshot_on_event", "bool", False),
-    ("logic", "snapshot_events", "list", False),
-    ("logic", "snapshot_retain_days", "num", False),
-    ("logic", "db_retain_days", "num", False),
-    ("logic", "heatmap_decay", "num", False),
-    ("logic", "heatmap_gamma", "num", False),
-    ("logic", "heatmap_blur", "num", False),
+    # ---- deteksi (RESTART) ----
+    ("model", "conf", "num", True),                # sensitivitas deteksi orang
+    # ---- logika kafe (LIVE) ----
+    ("logic", "cashier_min_dwell_sec", "num", False),   # min detik di kasir = transaksi
+    ("logic", "seat_min_dwell_sec", "num", False),      # min detik diam = duduk
+    ("logic", "auto_seat_from_chair", "bool", False),   # kursi auto jadi zona duduk
+    ("logic", "queue_alert_count", "num", False),       # alert antri kasir
+    ("logic", "max_capacity", "num", False),            # alert kapasitas penuh
+    ("logic", "open_hours", "str", False),              # jam operasi
+    ("logic", "snapshot_on_event", "bool", False),      # foto pas event
     # ---- tampilan (LIVE) ----
     ("display", "show_boxes", "bool", False),
     ("display", "show_labels", "bool", False),
     ("display", "show_zones", "bool", False),
-    ("display", "jpeg_quality", "num", False),
     ("display", "stream_fps", "num", False),
-    ("display", "heatmap_refresh_sec", "num", False),
 ]
+# Knob lanjutan (tracker, imgsz, seat_memory, heatmap, retention, dll) sengaja TIDAK
+# di web -> diatur manual di config.yaml. Biar panel web bersih & fokus operasional.
 
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -1285,6 +1291,34 @@ def restart_pipeline():
     return jsonify({"ok": True})
 
 
+@app.route("/api/classes", methods=["GET", "POST"])
+def classes_cfg():
+    """On/off class deteksi. person (0) -> counting; sisanya -> objek digambar (furniture_classes)."""
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False}), 409
+    cfg = EDIT["cfg"]
+    if request.method == "GET":
+        with ZLOCK:
+            person = 0 in (cfg["model"].get("classes") or [])
+            furn = list(cfg["model"].get("furniture_classes") or [])
+            catalog = [{"id": k, "name": v} for k, v in COCO_NAMES.items()]
+        return jsonify({"catalog": catalog, "person": person, "furniture": furn})
+
+    d = request.get_json(force=True) or {}
+    with ZLOCK:
+        cfg["model"]["classes"] = [0] if d.get("person", True) else []
+        furn = []
+        for x in (d.get("furniture") or []):
+            try:
+                furn.append(int(x))
+            except (TypeError, ValueError):
+                pass
+        cfg["model"]["furniture_classes"] = sorted(set(furn))
+        _save_cfg()
+    RESTART.set()     # call_classes dibaca pas pipeline start -> perlu reload
+    return jsonify({"ok": True})
+
+
 # ---------------- kamera (switchable, zona per-kamera) ----------------
 @app.route("/api/cameras")
 def cameras_list():
@@ -1339,9 +1373,8 @@ def camera_update():
         if "address" in d:
             cam["address"] = (d["address"] or "").strip()
         _save_cfg()
-    # kalau yg diedit kamera aktif -> restart biar sumber baru kebuka
-    restart = (cid == cfg["active_camera"])
-    if restart:
+        restart = (cid == cfg["active_camera"])   # baca di dalam lock (anti race switch)
+    if restart:                                   # kamera aktif diedit -> reload sumber
         RESTART.set()
     return jsonify({"ok": True, "restart": restart})
 
