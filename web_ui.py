@@ -15,6 +15,8 @@ Pipeline jalan di background thread; Flask cuma nyajiin frame+stats.
 Gak ganggu main.py/zones.py — ini wrapper terpisah.
 """
 import os
+import io
+import csv
 import time
 import argparse
 import threading
@@ -34,6 +36,21 @@ from storage import Store
 
 STORE = Store()              # SQLite persist event + metrik harian
 FURN_NAMES = {56: "kursi", 60: "meja"}   # COCO: 56=chair, 60=dining table
+
+
+def is_open(spec):
+    """spec '' -> 24 jam. 'HH:MM-HH:MM' -> True kalau jam sekarang di rentang (support lewat tengah malam)."""
+    if not spec:
+        return True
+    try:
+        a, b = spec.split("-")
+        sh, sm = (int(x) for x in a.split(":"))
+        eh, em = (int(x) for x in b.split(":"))
+        now = datetime.now()
+        cur, start, end = now.hour * 60 + now.minute, sh * 60 + sm, eh * 60 + em
+        return start <= cur < end if start <= end else (cur >= start or cur < end)
+    except Exception:
+        return True
 
 # ---- shared state (pipeline thread -> Flask) ----
 STATE = {
@@ -154,6 +171,16 @@ def pipeline(cfg, args):
     auto_seat_on = bool(cfg["logic"].get("auto_seat_from_chair", False))   # chair -> zona auto, jangan digambar dobel
     queue_alert = int(cfg["logic"].get("queue_alert_count", 3))      # >= org di kasir = alert antri
     snap_on_ev = bool(cfg["logic"].get("snapshot_on_event", True))   # foto pas transaksi/masuk
+    snap_events = set(cfg["logic"].get("snapshot_events", ["transaction", "enter"]))
+    open_hours = cfg["logic"].get("open_hours", "") or ""            # jam operasi (kosong=24jam)
+    max_cap = int(cfg["logic"].get("max_capacity", 0) or 0)          # alert kapasitas penuh
+    furn_conf = float(cfg["model"].get("furniture_conf", conf))      # conf khusus furnitur
+    disp = cfg.get("display", {}) or {}
+    show_box = bool(disp.get("show_boxes", True))
+    show_lbl = bool(disp.get("show_labels", True))
+    show_zone = bool(disp.get("show_zones", True))
+    jpeg_q = int(disp.get("jpeg_quality", 80))
+    hm_refresh = float(disp.get("heatmap_refresh_sec", 5))
     os.makedirs("output/snapshots", exist_ok=True)
 
     with LOCK:
@@ -186,6 +213,22 @@ def pipeline(cfg, args):
         if frame_idx % skip != 0:
             continue
 
+        # re-baca knob "panas" tiap frame -> bisa diubah live dari /api/settings tanpa restart
+        with ZLOCK:
+            lg, disp = cfg["logic"], (cfg.get("display") or {})
+            min_area = float(lg.get("min_box_area_px", 0) or 0)
+            queue_alert = int(lg.get("queue_alert_count", 3))
+            snap_on_ev = bool(lg.get("snapshot_on_event", True))
+            snap_events = set(lg.get("snapshot_events", ["transaction", "enter"]))
+            open_hours = lg.get("open_hours", "") or ""
+            max_cap = int(lg.get("max_capacity", 0) or 0)
+            furn_conf = float(cfg["model"].get("furniture_conf", conf))
+            show_box = bool(disp.get("show_boxes", True))
+            show_lbl = bool(disp.get("show_labels", True))
+            show_zone = bool(disp.get("show_zones", True))
+            jpeg_q = int(disp.get("jpeg_quality", 80))
+            hm_refresh = float(disp.get("heatmap_refresh_sec", 5))
+
         frame = prep(raw)
         last_base = frame.copy()
 
@@ -195,6 +238,7 @@ def pipeline(cfg, args):
         else:
             t_now = time.time()
             iso_ts = datetime.now().isoformat(timespec="seconds")
+        open_now = is_open(open_hours)       # di luar jam buka -> gak dicatat
 
         zm = ZM["zm"]                       # ref terbaru (bisa di-swap saat edit zona)
         res = model(frame, conf=conf, iou=iou, imgsz=imgsz,
@@ -203,6 +247,8 @@ def pipeline(cfg, args):
         # PISAH: person -> counting/zona ; furnitur -> cuma digambar (gak ngotorin logika orang)
         cid = det_all.class_id if det_all.class_id is not None else np.array([])
         furn = det_all[np.isin(cid, furn_classes)] if len(furn_classes) and len(det_all) else det_all[np.zeros(len(det_all), bool)]
+        if len(furn) and furn_conf > conf:   # filter furnitur pakai conf sendiri
+            furn = furn[furn.confidence >= furn_conf]
         det = det_all[cid == 0] if len(det_all) else det_all
         if min_area > 0 and len(det):
             wh = det.xyxy[:, 2:4] - det.xyxy[:, 0:2]
@@ -218,8 +264,11 @@ def pipeline(cfg, args):
             zm.sync_auto_seats([], t_now)
 
         events = zm.update(det, t_now, iso_ts)
-        for e in events:
-            STORE.log(e)                       # persist ke SQLite (anti ilang restart)
+        if open_now:
+            for e in events:
+                STORE.log(e)                   # persist ke SQLite (cuma pas jam buka)
+        else:
+            events = []                        # tutup -> abaikan event (gak dihitung/snapshot)
 
         # annotate
         labels = []
@@ -233,9 +282,13 @@ def pipeline(cfg, args):
                 labels.append(f"#{tid} {int(secs)}s {tag}".strip())
             else:
                 labels.append(f"#{tid}")
-        annotated = box_annotator.annotate(frame.copy(), det)
-        annotated = label_annotator.annotate(annotated, det, labels)
-        annotated = zm.render_overlay(annotated)
+        annotated = frame.copy()
+        if show_box:
+            annotated = box_annotator.annotate(annotated, det)
+        if show_lbl:
+            annotated = label_annotator.annotate(annotated, det, labels)
+        if show_zone:
+            annotated = zm.render_overlay(annotated)
 
         # furnitur (kursi/meja): kotak cyan + hitung. TIDAK masuk counting orang.
         # Kalau auto-seat nyala, chair (56) udah jadi zona auto_N -> jangan gambar dobel.
@@ -252,25 +305,31 @@ def pipeline(cfg, args):
 
         c = zm.counts
         ftxt = "  " + " ".join(f"{k}:{v}" for k, v in furn_count.items()) if furn_count else ""
-        cv2.putText(annotated, f"IN:{c['entered']} OUT:{c['exited']} now:{len(det)}{ftxt}",
+        closed_txt = "" if open_now else "  [TUTUP]"
+        cv2.putText(annotated, f"IN:{c['entered']} OUT:{c['exited']} now:{len(det)}{ftxt}{closed_txt}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-        # snapshot pas event penting (transaksi / orang masuk)
+        # snapshot pas event terpilih (config snapshot_events)
         if snap_on_ev:
             for e in events:
-                if e["event"] in ("transaction", "enter"):
+                if e["event"] in snap_events:
                     fn = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                     cv2.imwrite(f"output/snapshots/{fn}_{e['event']}_{e['zone']}.jpg", annotated)
 
         # metrik live + alert
         occ = zm.occupancy(t_now)
+        inside_live = max(0, c["entered"] - c["exited"])
         alerts = []
+        if not open_now:
+            alerts.append("TUTUP - di luar jam buka, gak dihitung")
+        if max_cap > 0 and inside_live >= max_cap:
+            alerts.append(f"Kapasitas penuh: {inside_live}/{max_cap}")
         if occ["cashier_now"] >= queue_alert:
             alerts.append(f"Antri kasir: {occ['cashier_now']} orang")
         if STATE["stale"]:
             alerts.append("Stream CCTV putus")
 
-        ok_enc, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        ok_enc, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, jpeg_q])
 
         # fps
         fps_n += 1
@@ -292,8 +351,8 @@ def pipeline(cfg, args):
             for e in events:
                 STATE["events"].appendleft(e)
 
-        # heatmap refresh tiap 5s
-        if now - hm_save_t >= 5.0:
+        # heatmap refresh (interval dari config)
+        if now - hm_save_t >= hm_refresh:
             try:
                 zm.save_heatmap("output/heatmap.png", base_frame=last_base)
             except Exception as ex:
@@ -367,6 +426,33 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
   .met .m .v{font-size:20px;font-weight:700}
   .met .m .k{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}
   .met .inside .v{color:var(--now)} .met .conv .v{color:var(--acc)}
+  .legend{display:flex;gap:14px;padding:2px 12px 8px;font-size:11px;color:var(--mut)}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
+  .dlbar{display:flex;gap:8px;padding:0 12px 12px;flex-wrap:wrap}
+  .dl{flex:1;text-align:center;background:#21262d;color:var(--tx);border:1px solid var(--bd);
+      border-radius:6px;padding:7px 8px;font-size:12px;text-decoration:none;white-space:nowrap}
+  .dl:hover{border-color:#8b949e}
+  .modal{display:none;position:fixed;inset:0;background:#000b;z-index:50;
+         align-items:center;justify-content:center;padding:16px}
+  .modal.on{display:flex}
+  .sheet{background:var(--card);border:1px solid var(--bd);border-radius:12px;
+         width:100%;max-width:560px;max-height:88vh;display:flex;flex-direction:column}
+  .shead{padding:12px 16px;border-bottom:1px solid var(--bd);display:flex;align-items:center}
+  .shead b{font-size:15px}
+  .xbtn{margin-left:auto;background:#21262d;color:var(--tx);border:1px solid var(--bd);
+        border-radius:6px;padding:4px 10px;cursor:pointer}
+  .sbody{padding:8px 16px;overflow:auto}
+  .srow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #21262d}
+  .srow:last-child{border-bottom:0}
+  .srow label{flex:1;font-size:13px}
+  .srow .kk{font-size:10px;color:var(--mut);display:block}
+  .srow input[type=number],.srow input[type=text]{width:120px;background:#0d1117;color:var(--tx);
+        border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font-size:13px}
+  .srow input[type=checkbox]{width:18px;height:18px}
+  .sfoot{padding:12px 16px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:10px}
+  .smut{font-size:11px;color:var(--mut);flex:1}
+  .savebtn{background:var(--in);color:#000;border:0;border-radius:6px;padding:8px 16px;
+           font-weight:600;cursor:pointer}
   /* ---- responsive HP ---- */
   @media(max-width:860px){
     main{grid-template-columns:1fr;padding:10px;gap:10px}
@@ -409,6 +495,8 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
       <button id=b_clearroi>🧹 Hapus Lantai</button>
       <span class=sep></span>
       <button id=b_auto>🪑 Auto-kursi: ?</button>
+      <span class=sep></span>
+      <button id=b_settings>⚙ Setelan</button>
       <span class=hint id=ehint>mode Lihat</span>
     </div>
     <div class=vid style="position:relative">
@@ -439,6 +527,19 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
       <div class=peak id=peak>–</div>
     </div>
     <div class=panel>
+      <h2>Tren per jam (hari ini)</h2>
+      <canvas id=chart width=336 height=130 style="width:100%;display:block;padding:8px"></canvas>
+      <div class=legend>
+        <span><i style="background:#58a6ff"></i>masuk</span>
+        <span><i style="background:#bc8cff"></i>transaksi</span>
+        <span><i style="background:#d29922"></i>duduk</span>
+      </div>
+      <div class=dlbar>
+        <a class=dl href="/report.csv?type=events" download>⬇ CSV hari ini</a>
+        <a class=dl href="/report.csv?type=summary&days=30" download>⬇ Rekap 30 hari</a>
+      </div>
+    </div>
+    <div class=panel>
       <h2>Event terakhir</h2>
       <div class=evlist>
         <table><thead><tr><th>waktu</th><th>event</th><th>zona</th><th>id</th><th>dwell</th></tr></thead>
@@ -451,6 +552,17 @@ PAGE = """<!doctype html><html lang=id><head><meta charset=utf-8>
     </div>
   </aside>
 </main>
+<div class=modal id=settings_modal>
+  <div class=sheet>
+    <div class=shead><b>⚙ Setelan (live)</b>
+      <button id=s_close class=xbtn>✕</button></div>
+    <div class=sbody id=s_fields>memuat…</div>
+    <div class=sfoot>
+      <span class=smut>Tersimpan ke config.yaml. stream_fps butuh reload halaman.</span>
+      <button id=s_save class=savebtn>💾 Simpan</button>
+    </div>
+  </div>
+</div>
 <script>
 const $=s=>document.querySelector(s);
 async function tick(){
@@ -488,6 +600,35 @@ async function tick(){
 setInterval(tick,1000);tick();
 // heatmap cache-bust tiap 5s
 setInterval(()=>{$('#hm').src='/heatmap.png?t='+Date.now();},5000);
+
+// ---- grafik tren per jam ----
+async function drawChart(){
+  let data;
+  try{data=await(await fetch('/api/hourly')).json();}catch(e){return;}
+  const cvs=$('#chart'),x=cvs.getContext('2d'),W=cvs.width,H=cvs.height;
+  x.clearRect(0,0,W,H);
+  const padL=22,padB=14,padT=6;
+  const series=[['entered','#58a6ff'],['transactions','#bc8cff'],['seated','#d29922']];
+  const max=Math.max(1,...data.flatMap(d=>series.map(s=>d[s[0]])));
+  const gw=(W-padL)/24, bw=Math.max(1,(gw-2)/3);
+  x.strokeStyle='#30363d';x.fillStyle='#8b949e';x.font='9px system-ui';x.lineWidth=1;
+  // sumbu Y (max + tengah)
+  [max,Math.round(max/2),0].forEach(v=>{
+    const yy=padT+(H-padT-padB)*(1-v/max);
+    x.beginPath();x.moveTo(padL,yy);x.lineTo(W,yy);x.globalAlpha=.25;x.stroke();x.globalAlpha=1;
+    x.fillText(v,0,yy+3);
+  });
+  data.forEach((d,h)=>{
+    const x0=padL+h*gw;
+    series.forEach((s,si)=>{
+      const v=d[s[0]],bh=(H-padT-padB)*(v/max);
+      x.fillStyle=s[1];
+      x.fillRect(x0+1+si*bw,H-padB-bh,bw,bh);
+    });
+    if(h%3===0){x.fillStyle='#8b949e';x.fillText(h,x0+1,H-3);}
+  });
+}
+drawChart();setInterval(drawChart,10000);
 
 // ---------------- editor zona ----------------
 const COL={line:'#ff00ff',cashier:'#ffa500',seat:'#00ff00',staff:'#c800c8',roi:'#1e90ff'};
@@ -576,6 +717,64 @@ $('#b_undo').onclick=()=>post('/api/undo');
 $('#b_clearroi').onclick=()=>post('/api/clear_roi');
 $('#b_flip').onclick=()=>post('/api/flip');
 $('#b_auto').onclick=()=>post('/api/toggle_auto');
+
+// ----- panel setelan -----
+const SLABEL={
+ cashier_min_dwell_sec:'Kasir: min detik = transaksi',
+ cashier_max_dwell_sec:'Kasir: max detik (lebih=staff)',
+ seat_min_dwell_sec:'Kursi: min detik diam = duduk',
+ seat_move_eps_px:'Kursi: gerak < px = diam',
+ zone_exit_grace_sec:'Toleransi ilang sblm keluar (dtk)',
+ seat_memory_sec:'Memori kursi: ingat brp detik',
+ seat_memory_px:'Memori kursi: radius cocok (px)',
+ min_box_area_px:'Buang kotak < px² (0=semua)',
+ line_crossing_frames:'Frame nyebrang garis',
+ auto_seat_ttl_sec:'Auto-kursi: slot ilang (dtk)',
+ auto_seat_grow_up:'Auto-kursi: perbesar ke atas ×',
+ auto_seat_ema:'Auto-kursi: smoothing (0-1)',
+ auto_seat_iou:'Auto-kursi: ambang cocok IoU',
+ queue_alert_count:'Alert antri kasir >= org',
+ max_capacity:'Alert kapasitas penuh (0=off)',
+ open_hours:'Jam buka (kosong=24j, 08:00-22:00)',
+ snapshot_on_event:'Foto pas event',
+ heatmap_gamma:'Heatmap gamma (<1 angkat sepi)',
+ heatmap_blur:'Heatmap blur',
+ furniture_conf:'Conf furnitur (kursi/meja)',
+ show_boxes:'Tampil kotak orang',
+ show_labels:'Tampil label id/detik',
+ show_zones:'Tampil garis/zona',
+ jpeg_quality:'Kualitas JPEG (1-100)',
+ stream_fps:'FPS stream ke browser',
+ heatmap_refresh_sec:'Refresh heatmap (dtk)',
+};
+let SFIELDS=[];
+async function openSettings(){
+  const d=await(await fetch('/api/settings')).json();
+  SFIELDS=d.fields||[];
+  $('#s_fields').innerHTML=SFIELDS.map((f,i)=>{
+    const lab=SLABEL[f.key]||f.key;
+    let inp;
+    if(f.type==='bool')inp=`<input type=checkbox data-i=${i} ${f.val?'checked':''}>`;
+    else if(f.type==='str')inp=`<input type=text data-i=${i} value="${f.val??''}">`;
+    else inp=`<input type=number step=any data-i=${i} value="${f.val??0}">`;
+    return `<div class=srow><label>${lab}<span class=kk>${f.key}</span></label>${inp}</div>`;
+  }).join('');
+  $('#settings_modal').classList.add('on');
+}
+$('#b_settings').onclick=openSettings;
+$('#s_close').onclick=()=>$('#settings_modal').classList.remove('on');
+$('#settings_modal').addEventListener('click',e=>{
+  if(e.target.id==='settings_modal')$('#settings_modal').classList.remove('on');});
+$('#s_save').onclick=async()=>{
+  const body={};
+  $('#s_fields').querySelectorAll('input[data-i]').forEach(el=>{
+    const f=SFIELDS[+el.dataset.i];
+    body[f.key]=f.type==='bool'?el.checked:el.value;
+  });
+  const r=await post('/api/settings',body);
+  if(r&&r.ok){$('#settings_modal').classList.remove('on');
+    $('#feed').src='/video?'+Date.now();}  // reload stream biar stream_fps/display kepasang
+};
 window.addEventListener('keydown',e=>{
   if(e.key==='Enter')commitPoly();
   else if(e.key==='z'){pts.pop();draw();}
@@ -592,6 +791,8 @@ def index():
 
 @app.route("/video")
 def video():
+    fps = int((EDIT["cfg"] or {}).get("display", {}).get("stream_fps", 25)) if EDIT["cfg"] else 25
+    delay = 1.0 / max(1, fps)
     def gen():
         boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
         while True:
@@ -601,7 +802,7 @@ def video():
                 time.sleep(0.05)
                 continue
             yield boundary + jpg + b"\r\n"
-            time.sleep(0.04)   # ~25 fps cap kirim ke browser
+            time.sleep(delay)   # cap fps kirim ke browser (config stream_fps)
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -632,6 +833,32 @@ def stats():
 @app.route("/api/history")
 def history():
     return jsonify(STORE.history(int(request.args.get("days", 7))))
+
+
+@app.route("/api/hourly")
+def hourly():
+    return jsonify(STORE.hourly(request.args.get("day") or None))
+
+
+@app.route("/report.csv")
+def report_csv():
+    """Unduh laporan CSV. ?type=events (mentah, default) | summary (rekap harian)."""
+    typ = request.args.get("type", "events")
+    day = request.args.get("day") or datetime.now().strftime("%Y-%m-%d")
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    if typ == "summary":
+        w.writerow(["hari", "masuk", "transaksi", "duduk", "rata2_duduk_dtk"])
+        for r in STORE.history(int(request.args.get("days", 30))):
+            w.writerow([r["day"], r["entered"], r["transactions"], r["seated"], r["avg_seat_sec"]])
+        fname = "laporan_rekap.csv"
+    else:
+        w.writerow(["waktu", "event", "zona", "track_id", "dwell_detik"])
+        for ts, ev, zn, tid, dw in STORE.events_for(day):
+            w.writerow([ts, ev, zn, tid, "" if dw is None else round(dw, 1)])
+        fname = f"laporan_{day}.csv"
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
 
 
 @app.route("/heatmap.png")
@@ -749,6 +976,75 @@ def clear_roi():
     return jsonify({"ok": True})
 
 
+# Knob yg bisa diubah live dari web. (section, key, tipe). Model/source/tracker = restart-only, gak masuk sini.
+SETTINGS_SPEC = [
+    ("logic", "cashier_min_dwell_sec", "num"),
+    ("logic", "cashier_max_dwell_sec", "num"),
+    ("logic", "seat_min_dwell_sec", "num"),
+    ("logic", "seat_move_eps_px", "num"),
+    ("logic", "zone_exit_grace_sec", "num"),
+    ("logic", "seat_memory_sec", "num"),
+    ("logic", "seat_memory_px", "num"),
+    ("logic", "min_box_area_px", "num"),
+    ("logic", "line_crossing_frames", "num"),
+    ("logic", "auto_seat_ttl_sec", "num"),
+    ("logic", "auto_seat_grow_up", "num"),
+    ("logic", "auto_seat_ema", "num"),
+    ("logic", "auto_seat_iou", "num"),
+    ("logic", "queue_alert_count", "num"),
+    ("logic", "max_capacity", "num"),
+    ("logic", "open_hours", "str"),
+    ("logic", "snapshot_on_event", "bool"),
+    ("logic", "heatmap_gamma", "num"),
+    ("logic", "heatmap_blur", "num"),
+    ("model", "furniture_conf", "num"),
+    ("display", "show_boxes", "bool"),
+    ("display", "show_labels", "bool"),
+    ("display", "show_zones", "bool"),
+    ("display", "jpeg_quality", "num"),
+    ("display", "stream_fps", "num"),
+    ("display", "heatmap_refresh_sec", "num"),
+]
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def settings():
+    if EDIT["cfg"] is None:
+        return jsonify({"ok": False, "err": "pipeline belum siap"}), 409
+    cfg = EDIT["cfg"]
+    if request.method == "GET":
+        with ZLOCK:
+            out = []
+            for sec, key, typ in SETTINGS_SPEC:
+                val = (cfg.get(sec) or {}).get(key)
+                out.append({"sec": sec, "key": key, "type": typ, "val": val})
+        return jsonify({"fields": out})
+
+    # POST: {key: val, ...}  (key unik antar section krn gak ada bentrok)
+    d = request.get_json(force=True) or {}
+    spec = {k: (sec, t) for sec, k, t in SETTINGS_SPEC}
+    with ZLOCK:
+        for k, v in d.items():
+            if k not in spec:
+                continue
+            sec, typ = spec[k]
+            try:
+                if typ == "num":
+                    v = float(v)
+                    if v == int(v):
+                        v = int(v)
+                elif typ == "bool":
+                    v = bool(v)
+                else:
+                    v = str(v)
+            except (TypeError, ValueError):
+                continue
+            cfg.setdefault(sec, {})[k] = v
+        _save_cfg()
+        _rebuild_zm()          # dwell/auto-seat knob masuk ZoneManager langsung
+    return jsonify({"ok": True})
+
+
 def cleanup_snapshots(folder, days):
     """Hapus foto snapshot lebih tua dari `days` hari (jaga disk gak penuh). 0=skip."""
     if days <= 0 or not os.path.isdir(folder):
@@ -801,18 +1097,21 @@ def main():
     ap.add_argument("--source", choices=["rtsp", "file", "webcam"], default="rtsp")
     ap.add_argument("--cam", type=int, default=0, help="index webcam (--source webcam), default 0")
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument("--host", default=None, help="override config server.host")
+    ap.add_argument("--port", type=int, default=None, help="override config server.port")
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
+    srv = cfg.get("server", {}) or {}
+    host = args.host or srv.get("host", "127.0.0.1")    # CLI override > config > default
+    port = args.port or int(srv.get("port", 5000))
     th = threading.Thread(target=pipeline_supervisor, args=(cfg, args), daemon=True)
     th.start()
     threading.Thread(target=maintenance, args=(cfg,), daemon=True).start()
 
-    print(f"[WEB] http://{args.host}:{args.port}")
+    print(f"[WEB] http://{host}:{port}")
     try:
-        app.run(host=args.host, port=args.port, threaded=True, debug=False)
+        app.run(host=host, port=port, threaded=True, debug=False)
     finally:
         STOP.set()
         th.join(timeout=2.0)

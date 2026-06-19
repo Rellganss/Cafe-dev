@@ -34,6 +34,7 @@ model:
   furniture_classes:
   - 56
   - 60
+  furniture_conf: 0.4
 tracker:
   track_activation_threshold: 0.25
   lost_track_buffer: 60
@@ -42,6 +43,9 @@ tracker:
 processing:
   frame_skip: 1
   resize_width: 1280
+server:
+  host: 127.0.0.1
+  port: 5000
 output:
   annotated_video: output/annotated.mp4
   save_video: true
@@ -49,6 +53,13 @@ output:
   peak_csv: output/peak_hourly.csv
   heatmap_image: output/heatmap.png
   show_window: true
+display:
+  show_boxes: true
+  show_labels: true
+  show_zones: true
+  jpeg_quality: 80
+  stream_fps: 25
+  heatmap_refresh_sec: 5
 logic:
   cashier_min_dwell_sec: 4
   cashier_max_dwell_sec: 300
@@ -63,34 +74,70 @@ logic:
   auto_seat_from_chair: false
   auto_seat_ttl_sec: 3.0
   auto_seat_grow_up: 0.6
+  auto_seat_ema: 0.6
+  auto_seat_iou: 0.25
+  open_hours: ''
+  max_capacity: 0
+  queue_alert_count: 3
+  snapshot_on_event: true
+  snapshot_events:
+  - transaction
+  - enter
+  snapshot_retain_days: 7
+  db_retain_days: 0
   heatmap_decay: 0.0
   heatmap_gamma: 0.5
+  heatmap_blur: 15
 detect_roi: []
 lines: []
 zones:
-- name: meja_1
+- name: kasir_1
+  type: cashier
+  polygon:
+  - - 1
+    - 437
+  - - 407
+    - 261
+  - - 528
+    - 405
+  - - 187
+    - 719
+  - - 6
+    - 440
+- name: kerja_2
+  type: staff
+  polygon:
+  - - 1
+    - 211
+  - - 2
+    - 412
+  - - 319
+    - 289
+  - - 319
+    - 289
+  - - 267
+    - 168
+- name: meja_3
   type: seat
   polygon:
-  - - 263
-    - 512
-  - - 79
-    - 510
-  - - 58
-    - 712
-  - - 247
-    - 720
-  - - 263
-    - 512
-- name: meja_2
+  - - 148
+    - 473
+  - - 328
+    - 469
+  - - 326
+    - 715
+  - - 148
+    - 713
+- name: meja_4
   type: seat
   polygon:
-  - - 862
-    - 361
-  - - 683
+  - - 337
+    - 620
+  - - 332
+    - 365
+  - - 332
+    - 365
+  - - 492
     - 362
-  - - 675
-    - 577
-  - - 857
-    - 579
-  - - 864
-    - 361
+  - - 503
+    - 622

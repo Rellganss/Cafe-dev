@@ -50,6 +50,24 @@ class Store:
             "peak": {"hour": pk[0][0], "entries": pk[0][1]} if pk else None,
         }
 
+    def hourly(self, day=None):
+        """Sebaran per jam (0-23) hari `day`: masuk/transaksi/duduk. Buat grafik tren."""
+        day = day or datetime.now().strftime("%Y-%m-%d")
+        rows = self._q(
+            "SELECT CAST(strftime('%H',ts) AS INT) h,"
+            " SUM(event='enter'), SUM(event='transaction'), SUM(event='seated')"
+            " FROM events WHERE day=? GROUP BY h", (day,))
+        buckets = {int(r[0]): (r[1] or 0, r[2] or 0, r[3] or 0) for r in rows if r[0] is not None}
+        return [{"hour": h, "entered": buckets.get(h, (0, 0, 0))[0],
+                 "transactions": buckets.get(h, (0, 0, 0))[1],
+                 "seated": buckets.get(h, (0, 0, 0))[2]} for h in range(24)]
+
+    def events_for(self, day=None):
+        """Semua event mentah hari `day` (buat ekspor CSV)."""
+        day = day or datetime.now().strftime("%Y-%m-%d")
+        return self._q(
+            "SELECT ts,event,zone,track_id,dwell_sec FROM events WHERE day=? ORDER BY ts", (day,))
+
     def prune(self, days):
         """Hapus event lebih tua dari `days` hari. Jaga DB gak balon. 0=skip."""
         if days <= 0:

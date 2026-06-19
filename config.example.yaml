@@ -1,35 +1,37 @@
-# Template config. Copy ke config.yaml lalu isi RTSP kamera lu:
-#   cp config.example.yaml config.yaml
+# Template config. Copy ke config.yaml lalu isi RTSP kamera lu:  cp config.example.yaml config.yaml
 #
-# FUNGSI ZONA (digambar di dashboard http://localhost:5000):
-#   detect_roi            -> AREA LANTAI. Cuma orang di sini dideteksi (buang poster dinding). Kosong=seluruh layar.
-#   lines (garis masuk)   -> orang nyebrang = dihitung MASUK / KELUAR.
-#   zones type: cashier   -> AREA KASIR. Orang diam di sini = TRANSAKSI.
-#   zones type: seat      -> AREA KURSI. Orang duduk di sini = DURASI DUDUK.
-#   zones type: staff     -> ZONA KERJA. Orang di sini = STAFF, gak dihitung customer.
+# FUNGSI ZONA (digambar di dashboard):
+#   detect_roi          -> AREA LANTAI. Cuma orang di sini dideteksi (buang poster dinding). Kosong=seluruh layar.
+#   lines (garis masuk) -> orang nyebrang = dihitung MASUK / KELUAR.
+#   zones cashier       -> AREA KASIR. Diam di sini = TRANSAKSI.
+#   zones seat          -> AREA KURSI. Duduk di sini = DURASI DUDUK.
+#   zones staff         -> ZONA KERJA. Orang di sini = STAFF, gak dihitung customer.
 source:
-  # Ganti user/pass/ip kamera. Hikvision: /Streaming/Channels/101 (main) atau 102 (sub).
-  rtsp: rtsp://USER:PASSWORD@CAMERA_IP:554/Streaming/Channels/101
+  rtsp: rtsp://USER:PASSWORD@CAMERA_IP:554/Streaming/Channels/101   # Hikvision: 101 main, 102 sub
   file: sample.mp4
 model:
-  weights: yolov8s.pt    # GTX1650 4GB. Naik yolov8m kalau GPU lebih kuat.
-  conf: 0.4
+  weights: yolov8s.pt    # GTX1650 -> s. GPU kuat -> m
+  conf: 0.3              # confidence person
   iou: 0.5
-  imgsz: 512             # 640 lebih akurat, 512/480 lebih cepat
-  device: 0              # 0=GPU NVIDIA, "cpu"=CPU
+  imgsz: 640             # 640 akurat, 512/480 cepat
+  device: 0              # 0=GPU, "cpu"=CPU
   classes:
-  - 0                    # 0 = person (COCO). Ini yg dihitung (masuk/duduk/transaksi).
+  - 0                    # 0 = person (yg dihitung)
   furniture_classes:     # cuma DIGAMBAR + dihitung, gak masuk logika orang. [] = off
   - 56                   # chair (kursi)
   - 60                   # dining table (meja)
+  furniture_conf: 0.4    # conf khusus furnitur (lebih tinggi -> kurangi salah deteksi)
 tracker:
   track_activation_threshold: 0.25
-  lost_track_buffer: 60
+  lost_track_buffer: 60        # jembatani occlusion ~4s (ID gak gampang switch)
   minimum_matching_threshold: 0.8
   frame_rate: 15
 processing:
-  frame_skip: 1
-  resize_width: 1280
+  frame_skip: 1                # proses tiap N frame (naikin kalau lag)
+  resize_width: 1280           # resize sebelum infer
+server:
+  host: 127.0.0.1              # 0.0.0.0 = bisa diakses HP (butuh buka firewall). 127.0.0.1 = localhost aja (aman)
+  port: 5000
 output:
   annotated_video: output/annotated.mp4
   save_video: true
@@ -37,27 +39,41 @@ output:
   peak_csv: output/peak_hourly.csv
   heatmap_image: output/heatmap.png
   show_window: true
+display:
+  show_boxes: true             # kotak orang
+  show_labels: true            # label #id + detik + DUDUK/KASIR
+  show_zones: true             # garis/zona/ROI overlay
+  jpeg_quality: 80             # 1-100. Turunin buat irit bandwidth HP
+  stream_fps: 25               # batas fps kirim ke browser
+  heatmap_refresh_sec: 5       # refresh file heatmap tiap N detik
 logic:
-  cashier_min_dwell_sec: 4
-  cashier_max_dwell_sec: 300
-  seat_min_dwell_sec: 30
-  seat_move_eps_px: 12
-  zone_exit_grace_sec: 1.5
-  seat_memory_sec: 30          # MEMORI kursi: orang duduk yg ilang (occlusion/ID switch) diingat sekian detik. Balik di posisi sama -> dwell LANJUT, gak reset. 0=off
-  seat_memory_px: 120          # radius posisi (px) buat nyocokin orang yg balik ke kursi yg sama
-  min_box_area_px: 1200
-  line_anchor: bottom_center   # titik bbox yg dicek nyebrang garis. RTSP top-down: bottom_center (kaki). webcam close-up (kaki ke-crop): center
-  line_crossing_frames: 1      # frame berturut di sisi seberang biar kehitung. 1=paling responsif, naikin kalau bbox goyang/jitter
-  auto_seat_from_chair: false  # true = chair (COCO) auto jadi zona kursi penghitung (gak usah gambar manual). butuh furniture_classes ada 56
-  auto_seat_ttl_sec: 3.0       # slot kursi-auto ilang kalau chair gak kelihatan sekian detik (anti-kedip)
-  auto_seat_grow_up: 0.6       # perbesar zona kursi-auto ke ATAS (x tinggi kursi) buat badan org duduk. Kekecilan=org duduk gak kena, kegedean=ketinggian/tumpuk
-  queue_alert_count: 3         # >= ini orang di kasir = alert "antri kasir"
-  snapshot_on_event: true      # simpen foto frame pas transaksi/orang masuk -> output/snapshots/
-  snapshot_retain_days: 7      # auto-hapus snapshot lebih tua dari ini (jaga disk). 0=simpen terus
-  db_retain_days: 0            # auto-hapus event DB lebih tua dari ini. 0=simpen history selamanya
-  heatmap_decay: 0.0
-  heatmap_gamma: 0.5
-# Gambar pakai: python setup_zones.py  (r=ROI, l=garis, p=kasir, s=kursi)
+  cashier_min_dwell_sec: 4     # >= ini di kasir = transaksi
+  cashier_max_dwell_sec: 300   # > ini = staff/nongkrong, BUKAN transaksi (0=off)
+  seat_min_dwell_sec: 30       # kaki diam >= ini = duduk beneran
+  seat_move_eps_px: 12         # gerak kaki < ini = diam
+  zone_exit_grace_sec: 1.5     # toleransi ilang sesaat sblm dianggap keluar (anti dwell pecah)
+  seat_memory_sec: 30          # MEMORI kursi: orang duduk yg ilang (occlusion/ID switch) diingat. Balik posisi sama -> dwell LANJUT. 0=off
+  seat_memory_px: 120          # radius cocokin orang yg balik ke kursi sama
+  min_box_area_px: 0           # buang kotak < ini px2 (0=terima semua)
+  line_anchor: center          # titik bbox cek nyebrang garis: bottom_center (kaki, top-down) / center (close-up)
+  line_crossing_frames: 1      # frame berturut biar kehitung (naikin kalau jitter)
+  auto_seat_from_chair: false  # true = chair auto jadi zona kursi penghitung (toggle live di dashboard juga)
+  auto_seat_ttl_sec: 3.0       # slot kursi-auto ilang kalau chair gak kelihatan sekian detik
+  auto_seat_grow_up: 0.6       # perbesar zona ke ATAS x tinggi kursi (badan org duduk)
+  auto_seat_ema: 0.6           # smoothing posisi slot (0-1)
+  auto_seat_iou: 0.25          # ambang cocokin chair ke slot
+  open_hours: ''               # '' = 24 jam. '08:00-22:00' = cuma jam operasi (buang staff malam). support lewat tengah malam
+  max_capacity: 0              # >0 = alert "kapasitas penuh" pas org di dalam >= ini
+  queue_alert_count: 3         # >= ini org di kasir = alert antri
+  snapshot_on_event: true      # simpen foto pas event -> output/snapshots/
+  snapshot_events:             # event mana yg di-snapshot
+  - transaction
+  - enter
+  snapshot_retain_days: 7      # auto-hapus snapshot lebih tua (0=simpen terus)
+  db_retain_days: 0            # auto-hapus event DB lebih tua (0=simpen selamanya)
+  heatmap_decay: 0.0           # >0 = heatmap "lupa" pelan
+  heatmap_gamma: 0.5           # <1 = angkat area sepi
+  heatmap_blur: 15             # blur heatmap
 detect_roi: []
 lines: []
 zones: []

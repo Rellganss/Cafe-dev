@@ -71,6 +71,9 @@ class ZoneManager:
         self.auto_seat = bool(L.get("auto_seat_from_chair", False))
         self.auto_seat_ttl = float(L.get("auto_seat_ttl_sec", 3.0))   # slot ilang kalau chair gak kelihatan sekian detik
         self.auto_seat_grow = float(L.get("auto_seat_grow_up", 0.6))  # perbesar zona ke ATAS x tinggi kursi (badan org duduk)
+        self.auto_seat_ema = float(L.get("auto_seat_ema", 0.6))       # smoothing posisi slot
+        self.auto_seat_iou = float(L.get("auto_seat_iou", 0.25))      # ambang cocokin chair ke slot
+        self.heatmap_blur = float(L.get("heatmap_blur", 15))          # blur heatmap
         self.auto_seats = []     # slot: {name,type,zone,tracks,box(EMA),last_seen}
         self._slot_n = 0
 
@@ -155,11 +158,18 @@ class ZoneManager:
             if self.auto_seats:        # baru dimatiin -> bersihin slot
                 self.auto_seats = []
             return
-        a = 0.6
+        a = self.auto_seat_ema
+
+        def occupied(s):    # masih ada track (termasuk yg lagi grace) -> jangan buang/geser
+            return bool(s["tracks"])
+
+        def remembered(s):  # masih ada memori -> tahan slot biar _dwell_zone yg expire+finalize
+            return bool(s.get("memory"))
+
         used = set()
         for cb in chair_boxes:
             cb = [float(v) for v in cb]
-            best, best_iou = -1, 0.25
+            best, best_iou = -1, self.auto_seat_iou
             for j, slot in enumerate(self.auto_seats):
                 if j in used:
                     continue
@@ -168,17 +178,18 @@ class ZoneManager:
                     best, best_iou = j, v
             if best >= 0:
                 s = self.auto_seats[best]
-                s["box"] = [a * s["box"][k] + (1 - a) * cb[k] for k in range(4)]   # EMA
+                if not occupied(s):    # FREEZE: slot keisi gak digeser gerakan/deteksi tiba-tiba
+                    s["box"] = [a * s["box"][k] + (1 - a) * cb[k] for k in range(4)]   # EMA
                 s["last_seen"] = t_now
                 used.add(best)
             else:
                 self._slot_n += 1
                 self.auto_seats.append({"name": f"auto_{self._slot_n}", "type": "seat",
-                                        "box": cb, "last_seen": t_now, "tracks": {}, "zone": None})
-        # buang slot basi (chair lama gak kelihatan & gak ada orang aktif)
+                                        "box": cb, "last_seen": t_now, "tracks": {}, "memory": [], "zone": None})
+        # buang slot basi: chair lama ilang DAN gak ada orang duduk DAN gak ada yg diingat
         self.auto_seats = [s for s in self.auto_seats
                            if t_now - s["last_seen"] <= self.auto_seat_ttl
-                           or any(t_now - st["last_in"] < self.grace for st in s["tracks"].values())]
+                           or occupied(s) or remembered(s)]
         # rebuild PolygonZone tiap slot dari box terbaru
         for s in self.auto_seats:
             s["zone"] = sv.PolygonZone(polygon=self._seat_polygon(s["box"]),
@@ -372,7 +383,7 @@ class ZoneManager:
             h = np.power(h, self.heat_gamma)          # gamma<1 -> angkat area sepi
         h8 = (h * 255).astype(np.uint8)
         h8 = cv2.resize(h8, (self.frame_wh[0], self.frame_wh[1]), interpolation=cv2.INTER_LINEAR)
-        h8 = cv2.GaussianBlur(h8, (0, 0), sigmaX=15)
+        h8 = cv2.GaussianBlur(h8, (0, 0), sigmaX=max(1, self.heatmap_blur))
         colored = cv2.applyColorMap(h8, cv2.COLORMAP_JET)
         if base_frame is not None:
             colored = cv2.addWeighted(base_frame, 0.5, colored, 0.5, 0)
